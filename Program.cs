@@ -1,114 +1,60 @@
-using System.Text;
-using System.Text.Json;
+using AlchemyProxy.Endpoints;
+using AlchemyProxy.Infrastructure;
+using AlchemyProxy.Services;
+using AlchemyProxy.Storage;
+using Microsoft.AspNetCore.Diagnostics;
+using Microsoft.AspNetCore.Mvc;
 
 var builder = WebApplication.CreateBuilder(args);
 
+builder.Services.Configure<AlchemyOptions>(builder.Configuration.GetSection(AlchemyOptions.SectionName));
+builder.Services.Configure<LocalStorageOptions>(builder.Configuration.GetSection(LocalStorageOptions.SectionName));
+
+builder.Services.AddHttpClient<AlchemyClient>((services, client) =>
+{
+    var options = services.GetRequiredService<Microsoft.Extensions.Options.IOptions<AlchemyOptions>>().Value;
+    client.BaseAddress = new Uri(options.BaseUrl);
+    client.Timeout = TimeSpan.FromSeconds(options.TimeoutSeconds);
+});
 builder.Services.AddHttpClient();
+
+builder.Services.AddSingleton<FileSolutionSnapshotStore>();
+builder.Services.AddSingleton<SqliteSessionStore>();
+builder.Services.AddScoped<SolutionLoader>();
+builder.Services.AddScoped<TroubleshootingService>();
 
 var app = builder.Build();
 
-app.MapPost("/api/insights", async (InsightRequest request, IHttpClientFactory httpClientFactory) =>
+app.UseExceptionHandler(errorApp =>
 {
-    var client = httpClientFactory.CreateClient();
-    var payload = JsonSerializer.Serialize(new { Text = request.Text });
-    var content = new StringContent(payload, Encoding.UTF8, "application/json");
-
-    var response = await client.PostAsync(
-        "https://alchemy.microsoft.com/api/v2/insights/app/servicenowvirtualagent", content);
-
-    response.EnsureSuccessStatusCode();
-
-    using var doc = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
-    var insightText = doc.RootElement
-        .GetProperty("Insights")[0]
-        .GetProperty("Description")
-        .GetString();
-
-    if (insightText is null)
-        return Results.Problem("No text found in first insight.");
-
-    // The text is escaped JSON — unescape and return as raw JSON
-    var unescaped = JsonSerializer.Deserialize<JsonElement>(insightText);
-    return Results.Json(unescaped);
-});
-
-app.MapPost("/api/getnode", async (GetNodeRequest request, IHttpClientFactory httpClientFactory) =>
-{
-    var client = httpClientFactory.CreateClient();
-    var payload = JsonSerializer.Serialize(new { Text = request.Query });
-    var content = new StringContent(payload, Encoding.UTF8, "application/json");
-
-    var response = await client.PostAsync(
-        "https://alchemy.microsoft.com/api/v2/insights/app/servicenowvirtualagent", content);
-    response.EnsureSuccessStatusCode();
-
-    using var doc = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
-    var insightText = doc.RootElement
-        .GetProperty("Insights")[0]
-        .GetProperty("Description")
-        .GetString();
-
-    if (insightText is null)
-        return Results.Problem("No text found in first insight.");
-
-    var insight = JsonSerializer.Deserialize<JsonElement>(insightText);
-    var startNodeId = insight.GetProperty("startNodeId").GetString();
-    var nodes = insight.GetProperty("nodes");
-
-    foreach (var node in nodes.EnumerateArray())
+    errorApp.Run(async context =>
     {
-        if (node.GetProperty("id").GetString() == startNodeId)
-            return Results.Json(node);
-    }
-
-    return Results.NotFound("Start node not found.");
-});
-
-app.MapGet("/api/getresource/{id}", async (string id, IHttpClientFactory httpClientFactory) =>
-{
-    var client = httpClientFactory.CreateClient();
-    var response = await client.GetAsync(
-        $"https://alchemy.microsoft.com/api/v2/app/servicenowvirtualagent/solutions/en-us/alchemyresource/{id}");
-    response.EnsureSuccessStatusCode();
-
-    using var doc = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
-    var solutionContent = doc.RootElement.GetProperty("SolutionContent").GetString();
-
-    if (solutionContent is null)
-        return Results.Problem("No SolutionContent found.");
-
-    return Results.Text(solutionContent, "application/json");
-});
-
-app.MapGet("/api/getbranching/{id}/{nodeId?}", async (string id, string? nodeId, IHttpClientFactory httpClientFactory) =>
-{
-    var client = httpClientFactory.CreateClient();
-    var response = await client.GetAsync(
-        $"https://alchemy.microsoft.com/api/v2/app/servicenowvirtualagent/solutions/en-us/branching/{id}");
-    response.EnsureSuccessStatusCode();
-
-    using var doc = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
-    var solutionContent = doc.RootElement.GetProperty("SolutionContent").GetString();
-
-    if (solutionContent is null)
-        return Results.Problem("No SolutionContent found.");
-
-    var parsed = JsonSerializer.Deserialize<JsonElement>(solutionContent);
-
-    if (!string.IsNullOrEmpty(nodeId) && parsed.TryGetProperty("nodes", out var nodes))
-    {
-        foreach (var node in nodes.EnumerateArray())
+        var error = context.Features.Get<IExceptionHandlerFeature>()?.Error;
+        var (status, code, title) = error switch
         {
-            if (node.GetProperty("id").GetString() == nodeId)
-                return Results.Json(node);
-        }
-        return Results.NotFound($"Node '{nodeId}' not found.");
-    }
+            ApiException api => (api.StatusCode, api.Code, api.Message),
+            HttpRequestException => (StatusCodes.Status503ServiceUnavailable, "alchemy_unavailable", "Alchemy is unavailable."),
+            System.Text.Json.JsonException => (StatusCodes.Status502BadGateway, "alchemy_invalid_response", "Alchemy returned an invalid response."),
+            _ => (StatusCodes.Status500InternalServerError, "internal_error", "An unexpected error occurred.")
+        };
 
-    return Results.Json(parsed);
+        context.Response.StatusCode = status;
+        await context.Response.WriteAsJsonAsync(new ProblemDetails
+        {
+            Status = status,
+            Title = title,
+            Detail = error is ApiException ? error.Message : null,
+            Type = $"https://alchemyproxy.local/problems/{code}",
+            Extensions = { ["code"] = code }
+        });
+    });
 });
+
+await app.Services.GetRequiredService<SqliteSessionStore>().InitializeAsync();
+
+app.MapTroubleshootingEndpoints();
+app.MapLegacyAlchemyEndpoints();
 
 app.Run();
 
-record InsightRequest(string Text);
-record GetNodeRequest(string Query);
+public partial class Program;
