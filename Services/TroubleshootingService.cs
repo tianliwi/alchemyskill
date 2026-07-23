@@ -23,10 +23,13 @@ public sealed class TroubleshootingService(
         }
 
         var locale = NormalizeLocale(request.Locale);
-        var snapshot = await solutionLoader.LoadAsync(request.Query.Trim(), locale, cancellationToken);
+        var snapshot = await solutionLoader.LoadRootAsync(request.Query.Trim(), locale, cancellationToken);
+        var position = await ResolvePositionAsync(
+            snapshot,
+            snapshot.RootGraphId,
+            snapshot.Graphs[snapshot.RootGraphId].StartNodeId,
+            cancellationToken);
         await snapshotStore.SaveAsync(snapshot, cancellationToken);
-
-        var position = ResolvePosition(snapshot, snapshot.RootGraphId, snapshot.Graphs[snapshot.RootGraphId].StartNodeId);
         var now = DateTimeOffset.UtcNow;
         var session = new TroubleshootingSession
         {
@@ -61,7 +64,7 @@ public sealed class TroubleshootingService(
             },
             cancellationToken);
 
-        return ToResponse(session, snapshot, includeSolution: true);
+        return await ToResponseAsync(session, snapshot, includeSolution: true, cancellationToken);
     }
 
     public async Task<SessionResponse> GetAsync(
@@ -71,7 +74,7 @@ public sealed class TroubleshootingService(
     {
         var session = await GetOwnedSessionAsync(sessionId, owner, cancellationToken);
         var snapshot = await LoadSnapshotAsync(session, cancellationToken);
-        return ToResponse(session, snapshot, includeSolution: true);
+        return await ToResponseAsync(session, snapshot, includeSolution: true, cancellationToken);
     }
 
     public async Task<SessionResponse> AnswerAsync(
@@ -114,7 +117,15 @@ public sealed class TroubleshootingService(
         }
 
         var previousRevision = session.Revision;
-        var position = ResolvePosition(snapshot, session.CurrentGraphId, choice.TargetNodeId);
+        var position = await ResolvePositionAsync(
+            snapshot,
+            session.CurrentGraphId,
+            choice.TargetNodeId,
+            cancellationToken);
+        if (position.SnapshotChanged)
+        {
+            await snapshotStore.UpdateAsync(snapshot, cancellationToken);
+        }
         var now = DateTimeOffset.UtcNow;
         session.CurrentGraphId = position.GraphId;
         session.CurrentNodeId = position.Node.Id;
@@ -141,7 +152,7 @@ public sealed class TroubleshootingService(
             },
             cancellationToken);
 
-        return ToResponse(session, snapshot, includeSolution: false);
+        return await ToResponseAsync(session, snapshot, includeSolution: false, cancellationToken);
     }
 
     public async Task<SessionResponse> EscalateAsync(
@@ -185,7 +196,7 @@ public sealed class TroubleshootingService(
             },
             cancellationToken);
 
-        return ToResponse(session, snapshot, includeSolution: false);
+        return await ToResponseAsync(session, snapshot, includeSolution: false, cancellationToken);
     }
 
     public async Task<object> GetContextAsync(
@@ -195,6 +206,12 @@ public sealed class TroubleshootingService(
     {
         var session = await GetOwnedSessionAsync(sessionId, owner, cancellationToken);
         var snapshot = await LoadSnapshotAsync(session, cancellationToken);
+        if (await solutionLoader.ExpandAllAsync(snapshot, cancellationToken))
+        {
+            await snapshotStore.UpdateAsync(snapshot, cancellationToken);
+        }
+
+        var hydratedSnapshot = await solutionLoader.HydrateSnapshotAsync(snapshot, cancellationToken);
         var events = await sessionStore.GetEventsAsync(sessionId, cancellationToken);
 
         return new
@@ -210,7 +227,7 @@ public sealed class TroubleshootingService(
                 "Do not invent troubleshooting instructions.",
                 "Do not claim success without user confirmation."
             },
-            Snapshot = snapshot,
+            Snapshot = hydratedSnapshot,
             History = events
         };
     }
@@ -246,12 +263,14 @@ public sealed class TroubleshootingService(
             session.Locale,
             cancellationToken);
 
-    private static ResolvedPosition ResolvePosition(
+    private async Task<ResolvedPosition> ResolvePositionAsync(
         SolutionSnapshot snapshot,
         string graphId,
-        string nodeId)
+        string nodeId,
+        CancellationToken cancellationToken)
     {
         var redirects = new HashSet<string>(StringComparer.Ordinal);
+        var snapshotChanged = false;
         while (true)
         {
             if (!snapshot.Graphs.TryGetValue(graphId, out var graph) ||
@@ -262,14 +281,22 @@ public sealed class TroubleshootingService(
 
             if (node.Type != "redirect")
             {
-                return new ResolvedPosition(graphId, node);
+                return new ResolvedPosition(graphId, node, snapshotChanged);
             }
 
-            if (!redirects.Add($"{graphId}:{nodeId}") ||
-                node.TargetGraphId is null ||
-                !snapshot.Graphs.TryGetValue(node.TargetGraphId, out var targetGraph))
+            if (!redirects.Add($"{graphId}:{nodeId}") || node.TargetGraphId is null)
             {
                 throw new ApiException(500, "solution_snapshot_invalid", "The solution contains an invalid redirect.");
+            }
+
+            if (!snapshot.Graphs.TryGetValue(node.TargetGraphId, out var targetGraph))
+            {
+                targetGraph = await solutionLoader.LoadBranchAsync(
+                    node.TargetGraphId,
+                    snapshot.Locale,
+                    cancellationToken);
+                snapshot.Graphs.Add(targetGraph.Id, targetGraph);
+                snapshotChanged = true;
             }
 
             graphId = targetGraph.Id;
@@ -300,12 +327,17 @@ public sealed class TroubleshootingService(
         }
     }
 
-    private static SessionResponse ToResponse(
+    private async Task<SessionResponse> ToResponseAsync(
         TroubleshootingSession session,
         SolutionSnapshot snapshot,
-        bool includeSolution)
+        bool includeSolution,
+        CancellationToken cancellationToken)
     {
-        var node = snapshot.Graphs[session.CurrentGraphId].Nodes[session.CurrentNodeId];
+        var storedNode = snapshot.Graphs[session.CurrentGraphId].Nodes[session.CurrentNodeId];
+        var node = await solutionLoader.HydrateNodeAsync(
+            storedNode,
+            session.Locale,
+            cancellationToken);
         return new SessionResponse
         {
             SessionId = session.SessionId,
@@ -321,8 +353,13 @@ public sealed class TroubleshootingService(
                 Type = node.Type == "text" ? "terminal" : node.Type,
                 Name = node.Name,
                 Instruction = node.Instruction,
-                Question = node.Question,
-                Choices = node.Choices.Select(choice => new StepChoiceResponse(choice.Id, choice.Label)).ToArray(),
+                Question = node.Question?.PlainText,
+                Choices = node.Choices.Select(choice => new StepChoiceResponse(
+                    choice.Id,
+                    choice.Label ?? throw new ApiException(
+                        500,
+                        "solution_snapshot_invalid",
+                        $"Choice {choice.Id} has no display label."))).ToArray(),
                 Outcome = node.Outcome,
                 AvailableActions = session.Status == "unresolved"
                     ? [new StepActionResponse("escalate", "Contact support")]
@@ -343,5 +380,8 @@ public sealed class TroubleshootingService(
         return normalized;
     }
 
-    private sealed record ResolvedPosition(string GraphId, SolutionNode Node);
+    private sealed record ResolvedPosition(
+        string GraphId,
+        SolutionNode Node,
+        bool SnapshotChanged);
 }

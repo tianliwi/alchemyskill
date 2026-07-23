@@ -9,6 +9,7 @@ var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.Configure<AlchemyOptions>(builder.Configuration.GetSection(AlchemyOptions.SectionName));
 builder.Services.Configure<LocalStorageOptions>(builder.Configuration.GetSection(LocalStorageOptions.SectionName));
+builder.Services.AddMemoryCache();
 
 builder.Services.AddHttpClient<AlchemyClient>((services, client) =>
 {

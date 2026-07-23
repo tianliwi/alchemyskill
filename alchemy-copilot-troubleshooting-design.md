@@ -208,7 +208,7 @@ Solution Store + Session Store + Telemetry
 
 ### 4.3 Solution-understanding phase
 
-At session start, the service returns a normalized graph containing:
+When complete AI context is requested, the service expands and returns a normalized graph containing:
 
 - Solution purpose and applicability.
 - Resolved instructions.

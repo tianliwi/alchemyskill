@@ -154,20 +154,20 @@ Responsibilities:
 - Search for the initial solution.
 - Select the branching insight.
 - Parse its serialized `Description`.
-- Initiate recursive graph expansion.
-- Resolve all resources.
-- Validate the assembled snapshot.
-- Produce a normalized immutable solution.
+- Normalize and validate the root graph.
+- Load redirected graphs only when traversal reaches them.
+- Resolve content resources only for the current displayed node.
+- Expand and hydrate the complete solution only for AI context or explicit validation.
 
 ### 4.3 Graph expander
 
 Responsibilities:
 
 - Start with the root branching graph.
-- Find every `redirectnode`.
-- Read its `targetDialogId`.
-- Fetch each referenced child graph.
-- Recursively inspect child graphs for additional redirects.
+- Read a reached `redirectnode` and its `targetDialogId`.
+- Fetch and cache the referenced child graph.
+- Enter the child graph at its `startNodeId`.
+- Recursively expand all redirects only when complete AI context is requested.
 - Deduplicate branch IDs.
 - Detect cycles and excessive traversal.
 
@@ -199,7 +199,7 @@ Required traversal limits:
 | Maximum redirect depth | 25 |
 | Maximum expanded payload | 25 MB |
 
-Exceeding a limit must fail solution loading with an explicit error. The service must not return a partially expanded solution as complete.
+Exceeding a limit must fail the current traversal or full-context expansion with an explicit error. A partially loaded session snapshot is valid, but it must never be labeled as complete AI context.
 
 ### 4.4 Resource resolver
 
@@ -214,8 +214,8 @@ The resolver must recursively inspect graph values for objects with:
 
 Responsibilities:
 
-- Collect unique resource IDs across all graphs.
-- Fetch resources with bounded concurrency.
+- Resolve resources referenced by the current displayed node.
+- Collect and resolve all unique resource IDs with bounded concurrency when full context is requested.
 - Deduplicate repeated resource references.
 - Preserve the Alchemy correlation ID.
 - Sanitize returned HTML.
@@ -299,7 +299,7 @@ The normalized representation should preserve:
 
 ## 5. Normalized Solution Model
 
-An expanded solution is an immutable snapshot.
+A session snapshot begins with the root graph and is augmented with pinned child graphs as redirects are reached. Complete expansion is performed only for AI context or explicit validation.
 
 ```json
 {
@@ -320,7 +320,7 @@ An expanded solution is an immutable snapshot.
 }
 ```
 
-The version should be a deterministic hash of the normalized graph and resource content. It pins active sessions to the exact content they started with.
+The root version is a deterministic hash of the normalized root graph. Each subsequently loaded branch and resource is cached by locale and identifier and pinned into the session snapshot.
 
 ### 5.1 Normalized choice node
 
@@ -513,10 +513,11 @@ Behavior:
 
 1. Search Alchemy.
 2. Select the first valid `Branching` insight.
-3. Load or reuse the expanded normalized solution.
+3. Normalize and validate only the root graph.
 4. Create the session.
-5. Resolve automatic redirects until an actionable or terminal node is reached.
-6. Return the current step.
+5. Resolve the current node's content resource when needed.
+6. Follow and load a redirect only if the root starts with one.
+7. Return the current step.
 
 If multiple branching insights are returned, the first valid result is used initially. The service must record the number and identifiers of other candidates for later solution-selection improvements.
 
@@ -789,7 +790,7 @@ Reusing a key with a different request body must return `409 idempotency_key_reu
 
 ### 12.1 Solution cache
 
-Store immutable expanded solution snapshots keyed by:
+Store incrementally populated session solution snapshots keyed by:
 
 ```text
 (rootSolutionId, locale, versionHash)
@@ -802,7 +803,8 @@ Recommended initial policy:
 - In-memory cache for local development.
 - Distributed cache for deployed environments.
 - 15-minute search-result TTL.
-- 60-minute expanded-solution refresh TTL.
+- Branch and resource fragment caches keyed by locale and ID.
+- Complete expansion only when the AI context endpoint is requested.
 - Active sessions retain their pinned solution snapshot until session expiration.
 
 A refresh failure must not mutate an existing snapshot. Continuing an active session with its already-pinned snapshot is allowed and should be logged.
@@ -1177,7 +1179,8 @@ Test:
 The first production-ready release is complete when:
 
 - The three Alchemy endpoints are integrated.
-- Branches and resources are recursively and completely resolved.
+- Branches and resources are loaded incrementally during traversal.
+- The AI context endpoint recursively resolves the complete solution.
 - Invalid or partial graphs are rejected.
 - Content is sanitized.
 - Sessions are durable and user-scoped.

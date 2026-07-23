@@ -5,64 +5,168 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using AlchemyProxy.Infrastructure;
 using AlchemyProxy.Models;
+using AlchemyProxy.Storage;
+using Microsoft.Extensions.Caching.Memory;
 
 namespace AlchemyProxy.Services;
 
-public sealed partial class SolutionLoader(AlchemyClient alchemyClient)
+public sealed partial class SolutionLoader(
+    AlchemyClient alchemyClient,
+    FileSolutionSnapshotStore snapshotStore,
+    IMemoryCache memoryCache)
 {
     private const int MaxGraphs = 100;
     private const int MaxNodes = 5_000;
     private const int MaxResources = 2_000;
 
-    public async Task<SolutionSnapshot> LoadAsync(
+    public async Task<SolutionSnapshot> LoadRootAsync(
         string query,
         string locale,
         CancellationToken cancellationToken)
     {
-        var rootJson = await alchemyClient.SearchBranchingGraphAsync(query, cancellationToken);
-        var rawGraphs = new Dictionary<string, JsonElement>(StringComparer.Ordinal);
+        var cacheKey = $"root:{locale}:{query.Trim().ToUpperInvariant()}";
+        if (!memoryCache.TryGetValue(cacheKey, out SolutionGraph? rootGraph) || rootGraph is null)
+        {
+            var rootJson = await alchemyClient.SearchBranchingGraphAsync(query, cancellationToken);
+            rootGraph = NormalizeGraph(ParseGraph(rootJson));
+            ValidateGraph(rootGraph);
+            memoryCache.Set(cacheKey, rootGraph, TimeSpan.FromMinutes(15));
+        }
+
+        var snapshot = new SolutionSnapshot
+        {
+            SolutionId = rootGraph.Id,
+            Version = ComputeVersion(rootGraph),
+            Locale = locale,
+            Title = rootGraph.Title,
+            RootGraphId = rootGraph.Id,
+            LoadedAt = DateTimeOffset.UtcNow,
+            Graphs = new Dictionary<string, SolutionGraph>(StringComparer.Ordinal)
+            {
+                [rootGraph.Id] = rootGraph
+            }
+        };
+
+        return snapshot;
+    }
+
+    public async Task<SolutionGraph> LoadBranchAsync(
+        string branchId,
+        string locale,
+        CancellationToken cancellationToken)
+    {
+        var cached = await snapshotStore.TryLoadGraphAsync(branchId, locale, cancellationToken);
+        if (cached is not null)
+        {
+            ValidateGraph(cached);
+            return cached;
+        }
+
+        var branchJson = await alchemyClient.GetBranchGraphAsync(branchId, locale, cancellationToken);
+        var graph = NormalizeGraph(ParseGraph(branchJson));
+        if (!string.Equals(branchId, graph.Id, StringComparison.Ordinal))
+        {
+            throw InvalidGraph($"Redirect target {branchId} returned graph {graph.Id}.");
+        }
+
+        ValidateGraph(graph);
+        await snapshotStore.SaveGraphAsync(graph, locale, cancellationToken);
+        return graph;
+    }
+
+    public async Task<bool> ExpandAllAsync(
+        SolutionSnapshot snapshot,
+        CancellationToken cancellationToken)
+    {
         var queue = new Queue<string>();
+        foreach (var graph in snapshot.Graphs.Values)
+        {
+            EnqueueRedirects(graph, queue);
+        }
 
-        var root = ParseGraph(rootJson);
-        var rootId = GetGraphId(root);
-        rawGraphs.Add(rootId, root);
-        EnqueueRedirects(root, queue);
-
+        var changed = false;
         while (queue.Count > 0)
         {
-            if (rawGraphs.Count >= MaxGraphs)
+            if (snapshot.Graphs.Count >= MaxGraphs)
             {
                 throw InvalidGraph("The solution exceeds the maximum graph count.");
             }
 
             var branchId = queue.Dequeue();
-            if (rawGraphs.ContainsKey(branchId))
+            if (snapshot.Graphs.ContainsKey(branchId))
             {
                 continue;
             }
 
-            var branchJson = await alchemyClient.GetBranchGraphAsync(branchId, locale, cancellationToken);
-            var branch = ParseGraph(branchJson);
-            var parsedId = GetGraphId(branch);
-            if (!string.Equals(branchId, parsedId, StringComparison.Ordinal))
-            {
-                throw InvalidGraph($"Redirect target {branchId} returned graph {parsedId}.");
-            }
-
-            rawGraphs.Add(parsedId, branch);
-            EnqueueRedirects(branch, queue);
+            var graph = await LoadBranchAsync(branchId, snapshot.Locale, cancellationToken);
+            snapshot.Graphs.Add(graph.Id, graph);
+            EnqueueRedirects(graph, queue);
+            changed = true;
         }
 
-        var totalNodes = rawGraphs.Values.Sum(GetNodes);
-        if (totalNodes > MaxNodes)
+        if (snapshot.Graphs.Values.Sum(graph => graph.Nodes.Count) > MaxNodes)
         {
             throw InvalidGraph("The solution exceeds the maximum node count.");
         }
 
-        var resourceIds = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var graph in rawGraphs.Values)
+        return changed;
+    }
+
+    public async Task<SolutionNode> HydrateNodeAsync(
+        SolutionNode node,
+        string locale,
+        CancellationToken cancellationToken)
+    {
+        var instruction = await HydrateContentAsync(node.Instruction, locale, cancellationToken);
+        var question = await HydrateContentAsync(node.Question, locale, cancellationToken);
+        var choices = new List<SolutionChoice>(node.Choices.Count);
+
+        foreach (var choice in node.Choices)
         {
-            CollectResourceIds(graph, resourceIds);
+            var label = choice.Label;
+            if (label is null && choice.ResourceId is not null)
+            {
+                label = await GetResourcePlainTextAsync(choice.ResourceId, locale, cancellationToken);
+            }
+
+            choices.Add(new SolutionChoice
+            {
+                Id = choice.Id,
+                Label = label,
+                ResourceId = choice.ResourceId,
+                TargetNodeId = choice.TargetNodeId
+            });
+        }
+
+        return new SolutionNode
+        {
+            Id = node.Id,
+            Type = node.Type,
+            Name = node.Name,
+            Instruction = instruction,
+            Question = question,
+            Choices = choices,
+            Outcome = node.Outcome,
+            TargetGraphId = node.TargetGraphId
+        };
+    }
+
+    public async Task<SolutionSnapshot> HydrateSnapshotAsync(
+        SolutionSnapshot snapshot,
+        CancellationToken cancellationToken)
+    {
+        var resourceIds = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var node in snapshot.Graphs.Values.SelectMany(graph => graph.Nodes.Values))
+        {
+            AddResourceId(node.Instruction, resourceIds);
+            AddResourceId(node.Question, resourceIds);
+            foreach (var choice in node.Choices)
+            {
+                if (choice.ResourceId is not null)
+                {
+                    resourceIds.Add(choice.ResourceId);
+                }
+            }
         }
 
         if (resourceIds.Count > MaxResources)
@@ -70,40 +174,75 @@ public sealed partial class SolutionLoader(AlchemyClient alchemyClient)
             throw InvalidGraph("The solution exceeds the maximum resource count.");
         }
 
-        var resources = new Dictionary<string, AlchemyResource>(StringComparer.Ordinal);
-        await Parallel.ForEachAsync(
-            resourceIds,
-            new ParallelOptions { MaxDegreeOfParallelism = 8, CancellationToken = cancellationToken },
-            async (resourceId, token) =>
-            {
-                var resource = await alchemyClient.GetResourceAsync(resourceId, locale, token);
-                lock (resources)
-                {
-                    resources.Add(resourceId, resource);
-                }
-            });
+        var resourceTasks = resourceIds.ToDictionary(
+            resourceId => resourceId,
+            resourceId => GetResourcePlainTextAsync(resourceId, snapshot.Locale, cancellationToken),
+            StringComparer.Ordinal);
+        await Task.WhenAll(resourceTasks.Values);
 
-        var graphs = rawGraphs.ToDictionary(
+        var resourceText = resourceTasks.ToDictionary(
             pair => pair.Key,
-            pair => NormalizeGraph(pair.Value, resources),
+            pair => pair.Value.Result,
             StringComparer.Ordinal);
 
-        ValidateGraphs(rootId, graphs);
+        var graphs = snapshot.Graphs.ToDictionary(
+            pair => pair.Key,
+            pair => new SolutionGraph
+            {
+                Id = pair.Value.Id,
+                Title = pair.Value.Title,
+                StartNodeId = pair.Value.StartNodeId,
+                Nodes = pair.Value.Nodes.ToDictionary(
+                    nodePair => nodePair.Key,
+                    nodePair => HydrateNodeFromCache(nodePair.Value, resourceText),
+                    StringComparer.Ordinal)
+            },
+            StringComparer.Ordinal);
 
-        var rootGraph = graphs[rootId];
-        var snapshot = new SolutionSnapshot
+        return new SolutionSnapshot
         {
-            SolutionId = rootId,
-            Version = string.Empty,
-            Locale = locale,
-            Title = rootGraph.Title,
-            RootGraphId = rootId,
-            LoadedAt = DateTimeOffset.UtcNow,
+            SolutionId = snapshot.SolutionId,
+            Version = snapshot.Version,
+            Locale = snapshot.Locale,
+            Title = snapshot.Title,
+            RootGraphId = snapshot.RootGraphId,
+            LoadedAt = snapshot.LoadedAt,
             Graphs = graphs
         };
+    }
 
-        snapshot.Version = ComputeVersion(snapshot);
-        return snapshot;
+    private async Task<ContentBlock?> HydrateContentAsync(
+        ContentBlock? content,
+        string locale,
+        CancellationToken cancellationToken)
+    {
+        if (content?.ResourceId is null || content.PlainText is not null)
+        {
+            return content;
+        }
+
+        return new ContentBlock
+        {
+            ResourceId = content.ResourceId,
+            PlainText = await GetResourcePlainTextAsync(content.ResourceId, locale, cancellationToken)
+        };
+    }
+
+    private async Task<string> GetResourcePlainTextAsync(
+        string resourceId,
+        string locale,
+        CancellationToken cancellationToken)
+    {
+        var cached = await snapshotStore.TryLoadResourceAsync(resourceId, locale, cancellationToken);
+        if (cached is not null)
+        {
+            return cached;
+        }
+
+        var resource = await alchemyClient.GetResourceAsync(resourceId, locale, cancellationToken);
+        var plainText = HtmlToPlainText(resource.Html);
+        await snapshotStore.SaveResourceAsync(resourceId, locale, plainText, cancellationToken);
+        return plainText;
     }
 
     private static JsonElement ParseGraph(string json)
@@ -112,9 +251,7 @@ public sealed partial class SolutionLoader(AlchemyClient alchemyClient)
         return document.RootElement.Clone();
     }
 
-    private static SolutionGraph NormalizeGraph(
-        JsonElement graph,
-        IReadOnlyDictionary<string, AlchemyResource> resources)
+    private static SolutionGraph NormalizeGraph(JsonElement graph)
     {
         var id = GetGraphId(graph);
         var title = graph.GetProperty("meta").TryGetProperty("title", out var titleElement)
@@ -123,9 +260,15 @@ public sealed partial class SolutionLoader(AlchemyClient alchemyClient)
         var startNodeId = GetRequiredString(graph, "startNodeId");
         var nodes = new Dictionary<string, SolutionNode>(StringComparer.Ordinal);
 
-        foreach (var rawNode in graph.GetProperty("nodes").EnumerateArray())
+        if (!graph.TryGetProperty("nodes", out var rawNodes) ||
+            rawNodes.ValueKind != JsonValueKind.Array)
         {
-            var node = NormalizeNode(rawNode, resources);
+            throw InvalidGraph($"Graph {id} is missing its nodes array.");
+        }
+
+        foreach (var rawNode in rawNodes.EnumerateArray())
+        {
+            var node = NormalizeNode(rawNode);
             if (!nodes.TryAdd(node.Id, node))
             {
                 throw InvalidGraph($"Graph {id} contains duplicate node ID {node.Id}.");
@@ -141,9 +284,7 @@ public sealed partial class SolutionLoader(AlchemyClient alchemyClient)
         };
     }
 
-    private static SolutionNode NormalizeNode(
-        JsonElement node,
-        IReadOnlyDictionary<string, AlchemyResource> resources)
+    private static SolutionNode NormalizeNode(JsonElement node)
     {
         var sourceType = GetRequiredString(node, "type");
         var type = sourceType.ToLowerInvariant() switch
@@ -160,16 +301,18 @@ public sealed partial class SolutionLoader(AlchemyClient alchemyClient)
         {
             foreach (var rawChoice in rawChoices.EnumerateArray())
             {
-                if (rawChoice.ValueKind != JsonValueKind.Object)
+                if (rawChoice.ValueKind != JsonValueKind.Object ||
+                    !rawChoice.TryGetProperty("id", out _))
                 {
                     continue;
                 }
 
+                var label = ResolveContent(rawChoice, "text");
                 choices.Add(new SolutionChoice
                 {
                     Id = GetRequiredString(rawChoice, "id"),
-                    Label = ResolveContent(rawChoice, "text", resources)?.PlainText
-                        ?? throw InvalidGraph("A choice is missing display text."),
+                    Label = label?.PlainText,
+                    ResourceId = label?.ResourceId,
                     TargetNodeId = GetRequiredString(rawChoice, "targetNodeId")
                 });
             }
@@ -180,18 +323,15 @@ public sealed partial class SolutionLoader(AlchemyClient alchemyClient)
             Id = GetRequiredString(node, "id"),
             Type = type,
             Name = GetOptionalString(node, "name"),
-            Instruction = ResolveContent(node, "text", resources),
-            Question = ResolveContent(node, "question", resources)?.PlainText,
+            Instruction = ResolveContent(node, "text"),
+            Question = ResolveContent(node, "question"),
             Choices = choices,
             Outcome = GetOptionalString(node, "outcomeSignal")?.ToLowerInvariant(),
             TargetGraphId = GetOptionalString(node, "targetDialogId")
         };
     }
 
-    private static ContentBlock? ResolveContent(
-        JsonElement owner,
-        string propertyName,
-        IReadOnlyDictionary<string, AlchemyResource> resources)
+    private static ContentBlock? ResolveContent(JsonElement owner, string propertyName)
     {
         if (!owner.TryGetProperty(propertyName, out var content) ||
             content.ValueKind != JsonValueKind.Object)
@@ -209,119 +349,100 @@ public sealed partial class SolutionLoader(AlchemyClient alchemyClient)
         return contentType?.ToLowerInvariant() switch
         {
             "embeddedplaintext" => new ContentBlock { PlainText = value },
-            "alchemyresource" when resources.TryGetValue(value, out var resource) =>
-                new ContentBlock { PlainText = HtmlToPlainText(resource.Html), ResourceId = value },
-            "alchemyresource" => throw InvalidGraph($"Resource {value} was not resolved."),
+            "alchemyresource" => new ContentBlock { ResourceId = value },
             _ => throw InvalidGraph($"Unsupported content type {contentType}.")
         };
     }
 
-    private static void ValidateGraphs(
-        string rootGraphId,
-        IReadOnlyDictionary<string, SolutionGraph> graphs)
+    private static void ValidateGraph(SolutionGraph graph)
     {
-        if (!graphs.ContainsKey(rootGraphId))
+        if (!graph.Nodes.ContainsKey(graph.StartNodeId))
         {
-            throw InvalidGraph("The root graph is missing.");
+            throw InvalidGraph($"Graph {graph.Id} has an invalid start node.");
         }
 
-        foreach (var graph in graphs.Values)
+        foreach (var node in graph.Nodes.Values)
         {
-            if (!graph.Nodes.ContainsKey(graph.StartNodeId))
+            if (node.Type == "choice")
             {
-                throw InvalidGraph($"Graph {graph.Id} has an invalid start node.");
+                if (node.Choices.Count == 0)
+                {
+                    throw InvalidGraph($"Choice node {node.Id} has no choices.");
+                }
+
+                foreach (var choice in node.Choices)
+                {
+                    if (!graph.Nodes.ContainsKey(choice.TargetNodeId))
+                    {
+                        throw InvalidGraph($"Choice {choice.Id} targets missing node {choice.TargetNodeId}.");
+                    }
+                }
             }
 
-            foreach (var node in graph.Nodes.Values)
+            if (node.Type == "redirect" && string.IsNullOrWhiteSpace(node.TargetGraphId))
             {
-                if (node.Type == "choice")
-                {
-                    if (node.Choices.Count == 0)
-                    {
-                        throw InvalidGraph($"Choice node {node.Id} has no choices.");
-                    }
-
-                    foreach (var choice in node.Choices)
-                    {
-                        if (!graph.Nodes.ContainsKey(choice.TargetNodeId))
-                        {
-                            throw InvalidGraph($"Choice {choice.Id} targets missing node {choice.TargetNodeId}.");
-                        }
-                    }
-                }
-
-                if (node.Type == "redirect" &&
-                    (string.IsNullOrWhiteSpace(node.TargetGraphId) ||
-                     !graphs.ContainsKey(node.TargetGraphId)))
-                {
-                    throw InvalidGraph($"Redirect node {node.Id} has an invalid target graph.");
-                }
+                throw InvalidGraph($"Redirect node {node.Id} has no target graph.");
             }
         }
     }
 
-    private static string ComputeVersion(SolutionSnapshot snapshot)
+    private static string ComputeVersion(SolutionGraph rootGraph)
     {
-        var loadedAt = snapshot.LoadedAt;
-        var copy = new SolutionSnapshot
-        {
-            SolutionId = snapshot.SolutionId,
-            Version = string.Empty,
-            Locale = snapshot.Locale,
-            Title = snapshot.Title,
-            RootGraphId = snapshot.RootGraphId,
-            LoadedAt = DateTimeOffset.UnixEpoch,
-            Graphs = snapshot.Graphs
-        };
-        var json = JsonSerializer.Serialize(copy);
+        var json = JsonSerializer.Serialize(rootGraph);
         var hash = SHA256.HashData(Encoding.UTF8.GetBytes(json));
-        _ = loadedAt;
         return $"sha256:{Convert.ToHexString(hash).ToLowerInvariant()}";
     }
 
-    private static void EnqueueRedirects(JsonElement graph, Queue<string> queue)
+    private static void EnqueueRedirects(SolutionGraph graph, Queue<string> queue)
     {
-        foreach (var node in graph.GetProperty("nodes").EnumerateArray())
+        foreach (var target in graph.Nodes.Values
+                     .Where(node => node.Type == "redirect" && node.TargetGraphId is not null)
+                     .Select(node => node.TargetGraphId!))
         {
-            if (string.Equals(GetOptionalString(node, "type"), "redirectnode", StringComparison.OrdinalIgnoreCase) &&
-                GetOptionalString(node, "targetDialogId") is { Length: > 0 } target)
-            {
-                queue.Enqueue(target);
-            }
+            queue.Enqueue(target);
         }
     }
 
-    private static void CollectResourceIds(JsonElement element, HashSet<string> resourceIds)
+    private static void AddResourceId(ContentBlock? content, HashSet<string> resourceIds)
     {
-        if (element.ValueKind == JsonValueKind.Object)
+        if (content?.ResourceId is not null)
         {
-            if (string.Equals(
-                    GetOptionalString(element, "contentType"),
-                    "alchemyresource",
-                    StringComparison.OrdinalIgnoreCase) &&
-                GetOptionalString(element, "content") is { Length: > 0 } resourceId)
-            {
-                resourceIds.Add(resourceId);
-            }
-
-            foreach (var property in element.EnumerateObject())
-            {
-                CollectResourceIds(property.Value, resourceIds);
-            }
-        }
-        else if (element.ValueKind == JsonValueKind.Array)
-        {
-            foreach (var item in element.EnumerateArray())
-            {
-                CollectResourceIds(item, resourceIds);
-            }
+            resourceIds.Add(content.ResourceId);
         }
     }
 
-    private static int GetNodes(JsonElement graph) =>
-        graph.TryGetProperty("nodes", out var nodes) && nodes.ValueKind == JsonValueKind.Array
-            ? nodes.GetArrayLength()
-            : throw InvalidGraph("A graph is missing its nodes array.");
+    private static SolutionNode HydrateNodeFromCache(
+        SolutionNode node,
+        IReadOnlyDictionary<string, string> resourceText) =>
+        new()
+        {
+            Id = node.Id,
+            Type = node.Type,
+            Name = node.Name,
+            Instruction = HydrateContentFromCache(node.Instruction, resourceText),
+            Question = HydrateContentFromCache(node.Question, resourceText),
+            Choices = node.Choices.Select(choice => new SolutionChoice
+            {
+                Id = choice.Id,
+                Label = choice.Label ??
+                    (choice.ResourceId is not null ? resourceText[choice.ResourceId] : null),
+                ResourceId = choice.ResourceId,
+                TargetNodeId = choice.TargetNodeId
+            }).ToArray(),
+            Outcome = node.Outcome,
+            TargetGraphId = node.TargetGraphId
+        };
+
+    private static ContentBlock? HydrateContentFromCache(
+        ContentBlock? content,
+        IReadOnlyDictionary<string, string> resourceText) =>
+        content?.ResourceId is null
+            ? content
+            : new ContentBlock
+            {
+                ResourceId = content.ResourceId,
+                PlainText = resourceText[content.ResourceId]
+            };
 
     private static string GetGraphId(JsonElement graph) =>
         graph.TryGetProperty("meta", out var meta)

@@ -40,7 +40,7 @@ public sealed class SolutionNode
 
     public ContentBlock? Instruction { get; init; }
 
-    public string? Question { get; init; }
+    public ContentBlock? Question { get; init; }
 
     public IReadOnlyList<SolutionChoice> Choices { get; init; } = [];
 
@@ -51,7 +51,7 @@ public sealed class SolutionNode
 
 public sealed class ContentBlock
 {
-    public required string PlainText { get; init; }
+    public string? PlainText { get; init; }
 
     public string? ResourceId { get; init; }
 }
@@ -60,7 +60,9 @@ public sealed class SolutionChoice
 {
     public required string Id { get; init; }
 
-    public required string Label { get; init; }
+    public string? Label { get; init; }
+
+    public string? ResourceId { get; init; }
 
     public required string TargetNodeId { get; init; }
 }

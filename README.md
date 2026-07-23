@@ -2,13 +2,14 @@
 
 Alchemy Skill exposes Alchemy's curated branching troubleshooting solutions as a session-based API suitable for Microsoft 365 Copilot and other conversational clients.
 
-The API recursively loads redirected branches, resolves Alchemy display resources, normalizes the complete solution graph, and guides users through deterministic troubleshooting one step at a time.
+The API loads the initial Alchemy graph immediately, fetches redirected branches and display resources only when needed, and guides users through deterministic troubleshooting one step at a time.
 
 ## Features
 
 - Searches Alchemy using a natural-language issue description.
-- Recursively follows `redirectnode` branches.
-- Resolves referenced `alchemyresource` content.
+- Loads `redirectnode` branches incrementally when a session reaches them.
+- Resolves `alchemyresource` content only for the step being displayed.
+- Caches queries, branch graphs, and resolved resource text.
 - Normalizes Alchemy graphs into a stable API model.
 - Stores troubleshooting sessions in local SQLite.
 - Pins sessions to immutable compressed solution snapshots.
@@ -164,6 +165,6 @@ Errors use `application/problem+json`. Important responses include:
 
 ## Current status
 
-The local C# implementation supports complete graph expansion and deterministic session traversal. The `Can't start outlook` scenario has been exercised through Windows, Microsoft 365, unsuccessful remediation, escalation, and process restart with SQLite persistence.
+The local C# implementation supports incremental graph loading, explicit full expansion through the context endpoint, and deterministic session traversal. The `Can't start outlook` scenario has been exercised through Windows, Microsoft 365, unsuccessful remediation, escalation, and process restart with SQLite persistence.
 
 Production authentication, distributed storage, idempotency records, and Microsoft 365 Copilot packaging remain future work.
